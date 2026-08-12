@@ -1162,13 +1162,49 @@
       </div>
     </div>
 
-    <footer>DATACENTER · Mode terang / gelap · Upload Excel</footer>
+    <footer>DATACENTER · Mode terang / gelap · Upload Excel · <span id="syncStatus" style="opacity:0.8;">⏳ Memuat...</span></footer>
   </div>
 
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script>
     let allRows = [];
 
-    // ---- IndexedDB persistence ----
+    // ---- Supabase cloud sync (data update di semua device) ----
+    const SUPABASE_URL = 'https://hmdazjjoqqmvxhufbjdf.supabase.co';
+    const SUPABASE_KEY = 'sb_publishable_JVf03JW8EcN0PQZP4nWtZQ_Vx9g_yt8';
+    const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    const SB_TABLE = 'datacenter_state';
+    const syncStatusEl = () => document.getElementById('syncStatus');
+
+    function setSyncStatus(text) {
+      const el = syncStatusEl();
+      if (el) el.textContent = text;
+      console.log('[sync]', text);
+    }
+
+    async function pushStateToCloud(id, data) {
+      try {
+        setSyncStatus('⏳ Menyimpan ke cloud...');
+        const { error } = await sb.from(SB_TABLE).upsert({ id, data, updated_at: new Date().toISOString() });
+        if (error) { setSyncStatus('⚠️ Gagal sync: ' + error.message); return; }
+        setSyncStatus('✅ Tersinkron ' + new Date().toLocaleTimeString('id-ID'));
+      } catch (err) {
+        setSyncStatus('⚠️ Gagal sync: ' + err.message);
+      }
+    }
+
+    async function pullStateFromCloud(id) {
+      try {
+        const { data, error } = await sb.from(SB_TABLE).select('data').eq('id', id).maybeSingle();
+        if (error) { console.warn('Gagal ambil data cloud (' + id + '):', error.message); return null; }
+        return data ? data.data : null;
+      } catch (err) {
+        console.warn('Gagal ambil data cloud (' + id + '):', err);
+        return null;
+      }
+    }
+
+    // ---- IndexedDB persistence (cache lokal, untuk mode offline) ----
     const DB_NAME = 'uangMasukDB';
     const DB_VERSION = 1;
     const DB_STORE = 'rows';
@@ -1203,6 +1239,7 @@
       } catch (err) {
         console.warn('Gagal simpan data ke IndexedDB:', err);
       }
+      pushStateToCloud('cash_inflow', allRows);
     }
 
     async function loadRowsFromDB() {
@@ -1232,6 +1269,7 @@
       } catch (err) {
         console.warn('Gagal hapus data di IndexedDB:', err);
       }
+      pushStateToCloud('cash_inflow', []);
     }
 
     const DB_KEY_SALES = 'salesRows';
@@ -1248,6 +1286,7 @@
       } catch (err) {
         console.warn('Gagal simpan data penjualan ke IndexedDB:', err);
       }
+      pushStateToCloud('sales', salesRows);
     }
 
     async function loadSalesFromDB() {
@@ -1277,6 +1316,7 @@
       } catch (err) {
         console.warn('Gagal hapus data penjualan di IndexedDB:', err);
       }
+      pushStateToCloud('sales', []);
     }
 
     const fileInput = document.getElementById('fileInput');
@@ -2741,32 +2781,82 @@
       fakturVirtual.setData(rows);
     }
 
-    // ---- Load persisted data from IndexedDB on startup ----
-    (async function initFromDB() {
-      const saved = await loadRowsFromDB();
-      if (saved && saved.length) {
-        allRows = saved;
-        invalidateFakturIndex();
+    // ---- Terapkan data cash inflow (dari cloud/lokal/realtime) ke UI ----
+    function applyCashData(rows) {
+      allRows = rows || [];
+      invalidateFakturIndex();
+      if (allRows.length) {
         emptyState.style.display = 'none';
         fileNameEl.textContent = 'Data tersimpan (' + allRows.length.toLocaleString('id-ID') + ' baris)';
         document.getElementById('clearBtn').style.display = 'block';
         showSummary();
         searchBar.classList.add('show');
+      } else {
+        emptyState.style.display = 'block';
+        document.getElementById('clearBtn').style.display = 'none';
+        searchBar.classList.remove('show');
       }
+      if (allRows.length || (typeof salesRows !== 'undefined' && salesRows.length)) {
+        document.getElementById('tabsBar').style.display = 'flex';
+      }
+    }
 
-      const savedSales = await loadSalesFromDB();
-      if (savedSales && savedSales.length) {
-        salesRows = savedSales.map(r => r.month ? r : Object.assign({}, r, { month: detectMonth(r.sheet, r.tanggal) || 'Lainnya' }));
+    // ---- Terapkan data penjualan (dari cloud/lokal/realtime) ke UI ----
+    function applySalesData(rows) {
+      salesRows = (rows || []).map(r => r.month ? r : Object.assign({}, r, { month: detectMonth(r.sheet, r.tanggal) || 'Lainnya' }));
+      if (salesRows.length) {
         salesEmptyState.style.display = 'none';
         salesFileNameEl.textContent = 'Data tersimpan (' + salesRows.length.toLocaleString('id-ID') + ' baris)';
         document.getElementById('clearSalesBtn').style.display = 'block';
         populateSalesFilters();
         doSalesSearch(); // filter ke bulan terbaru
+      } else {
+        salesEmptyState.style.display = 'block';
+        document.getElementById('clearSalesBtn').style.display = 'none';
       }
-
-      if ((saved && saved.length) || (savedSales && savedSales.length)) {
+      if (allRows.length || salesRows.length) {
         document.getElementById('tabsBar').style.display = 'flex';
       }
+    }
+
+    // ---- Load data: coba dari Supabase (cloud) dulu, fallback ke cache lokal (offline) ----
+    (async function initFromCloudOrDB() {
+      setSyncStatus('⏳ Memuat data...');
+      const [cashCloud, salesCloud] = await Promise.all([
+        pullStateFromCloud('cash_inflow'),
+        pullStateFromCloud('sales')
+      ]);
+
+      if (cashCloud) {
+        applyCashData(cashCloud);
+      } else {
+        const saved = await loadRowsFromDB();
+        if (saved && saved.length) applyCashData(saved);
+      }
+
+      if (salesCloud) {
+        applySalesData(salesCloud);
+      } else {
+        const savedSales = await loadSalesFromDB();
+        if (savedSales && savedSales.length) applySalesData(savedSales);
+      }
+
+      setSyncStatus(cashCloud || salesCloud ? '✅ Data terbaru dari cloud' : '📴 Mode offline (data lokal)');
+
+      // ---- Realtime: auto-update kalau rekan kerja upload/ubah data di device lain ----
+      sb.channel('datacenter-sync')
+        .on('postgres_changes', { event: '*', schema: 'public', table: SB_TABLE }, payload => {
+          const row = payload.new;
+          if (!row) return;
+          if (row.id === 'cash_inflow') {
+            applyCashData(row.data || []);
+            setSyncStatus('🔄 Data cash inflow diperbarui oleh rekan kerja · ' + new Date().toLocaleTimeString('id-ID'));
+          } else if (row.id === 'sales') {
+            applySalesData(row.data || []);
+            setSyncStatus('🔄 Data penjualan diperbarui oleh rekan kerja · ' + new Date().toLocaleTimeString('id-ID'));
+          }
+        })
+        .subscribe();
     })();
 
     // ---- PWA: install prompt ----
