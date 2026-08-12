@@ -1513,6 +1513,10 @@
         alert('File harus .xlsx atau .xls');
         return;
       }
+      if (!initialLoadDone) {
+        setSyncStatus('⏳ Menunggu data lama selesai dimuat sebelum upload...');
+        await initialLoadPromise;
+      }
       emptyState.style.display = 'none';
       loading.style.display = 'block';
       tableWrap.style.display = 'none';
@@ -1925,6 +1929,10 @@
       if (!files.length) {
         alert('File harus .xlsx atau .xls');
         return;
+      }
+      if (!initialLoadDone) {
+        setSyncStatus('⏳ Menunggu data lama selesai dimuat sebelum upload...');
+        await initialLoadPromise;
       }
       salesEmptyState.style.display = 'none';
       salesLoading.style.display = 'block';
@@ -2843,7 +2851,12 @@
     }
 
     // ---- Load data: coba dari Supabase (cloud) dulu, fallback ke cache lokal (offline) ----
-    (async function initFromCloudOrDB() {
+    // PENTING: initialLoadPromise WAJIB ditunggu (await) sebelum handleFiles/handleSalesFiles
+    // memproses upload apapun. Tanpa ini, upload yang dilakukan SEBELUM data lama selesai
+    // ditarik dari cloud akan menimpa (overwrite) seluruh data cloud dengan hanya isi file
+    // yang baru diupload -> inilah penyebab data bulan sebelumnya "hilang" saat upload bulan baru.
+    let initialLoadDone = false;
+    const initialLoadPromise = (async function initFromCloudOrDB() {
       setSyncStatus('⏳ Memuat data...');
       const [cashCloud, salesCloud] = await Promise.all([
         pullStateFromCloud('cash_inflow'),
@@ -2880,7 +2893,23 @@
           }
         })
         .subscribe();
+
+      initialLoadDone = true;
+      setUploadBlocking(false);
     })();
+
+    // ---- Cegah upload sebelum data lama selesai dimuat dari cloud ----
+    function setUploadBlocking(blocking) {
+      [fileInput, fileInputMain, document.getElementById('fileInputSales')].forEach(el => {
+        if (!el) return;
+        el.disabled = blocking;
+      });
+      const hint = 'Mohon tunggu, sedang memuat data lama dari cloud sebelum bisa upload file baru (supaya data bulan sebelumnya tidak tertimpa).';
+      [document.getElementById('fileInput'), document.getElementById('fileInputMain'), document.getElementById('fileInputSales')].forEach(el => {
+        if (el) el.title = blocking ? hint : '';
+      });
+    }
+    setUploadBlocking(true);
 
     // ---- Indikator status koneksi (biru kedip = online, merah diam = offline) ----
     function updateOnlineIndicator() {
