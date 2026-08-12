@@ -816,12 +816,35 @@
       .mini { min-width: 56px; padding: 4px 6px; }
       .mini .v { font-size: 0.8rem; }
     }
+
+    /* ---- Status koneksi: biru kedip = online, merah diam = offline ---- */
+    .brand { display: flex; align-items: center; gap: 8px; }
+    .online-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #3b82f6;
+      flex-shrink: 0;
+      animation: onlinePulse 1.6s ease-out infinite;
+    }
+    .online-dot.offline {
+      background: #ef4444;
+      animation: none;
+      box-shadow: none;
+    }
+    @keyframes onlinePulse {
+      0%   { box-shadow: 0 0 0 0 rgba(59,130,246,0.6); }
+      70%  { box-shadow: 0 0 0 7px rgba(59,130,246,0); }
+      100% { box-shadow: 0 0 0 0 rgba(59,130,246,0); }
+    }
   </style>
 </head>
 <body>
   <div class="top-header">
     <div class="header-inner">
       <div class="brand">
+        <span id="onlineDot" class="online-dot" title="Online"></span>
         <div>
           <h1>DATACENTER</h1>
         </div>
@@ -2858,6 +2881,22 @@
         })
         .subscribe();
     })();
+
+    // ---- Indikator status koneksi (biru kedip = online, merah diam = offline) ----
+    function updateOnlineIndicator() {
+      const dot = document.getElementById('onlineDot');
+      if (!dot) return;
+      if (navigator.onLine) {
+        dot.classList.remove('offline');
+        dot.title = 'Online — tersambung internet';
+      } else {
+        dot.classList.add('offline');
+        dot.title = 'Offline — tidak ada internet';
+      }
+    }
+    window.addEventListener('online', updateOnlineIndicator);
+    window.addEventListener('offline', updateOnlineIndicator);
+    updateOnlineIndicator();
 
     // ---- PWA: install prompt ----
     let deferredPrompt = null;
