@@ -1206,6 +1206,8 @@
     }
 
     async function pushStateToCloud(id, data) {
+      // Dipakai HANYA untuk kompatibilitas lama (tidak dipanggil lagi di alur normal
+      // setelah migrasi ke tabel per-baris). Disimpan agar tidak error jika terpanggil.
       try {
         setSyncStatus('⏳ Menyimpan ke cloud...');
         const { error } = await sb.from(SB_TABLE).upsert({ id, data, updated_at: new Date().toISOString() });
@@ -1224,6 +1226,73 @@
       } catch (err) {
         console.warn('Gagal ambil data cloud (' + id + '):', err);
         return null;
+      }
+    }
+
+    // ==== PENYIMPANAN CLOUD PER-BARIS (skalabel untuk data yang terus bertambah) ====
+    // Tabel baru di Supabase: cash_inflow_rows(row_key text primary key, data jsonb, updated_at)
+    //                         sales_rows(row_key text primary key, data jsonb, updated_at)
+    // Keuntungan dibanding 1 blob JSON besar:
+    //  - Upload cuma kirim baris yang BENAR-BENAR baru (bukan seluruh dataset tiap kali).
+    //  - Tidak ada lagi risiko "menimpa" data device lain: setiap baris punya row_key unik,
+    //    upsert per baris otomatis aman digabung dari banyak device sekaligus.
+    //  - Realtime update juga cuma kirim baris yang berubah, bukan seluruh dataset.
+    const CASH_TABLE = 'cash_inflow_rows';
+    const SALES_TABLE = 'sales_rows';
+    const cashRowKey = r => r.faktur + '|' + r.sheet + '|' + r.section + '|' + r.tagihan;
+    const salesRowKey = r => r.noFaktur + '|' + r.produk + '|' + r.jumlah + '|' + r.total + '|' + r.sheet;
+
+    // Kirim hanya baris yang baru/berubah ke cloud (bukan seluruh dataset).
+    async function pushNewRowsToCloud(table, newRows, keyFn) {
+      if (!newRows || !newRows.length) return;
+      try {
+        setSyncStatus('⏳ Menyimpan ' + newRows.length.toLocaleString('id-ID') + ' baris baru ke cloud...');
+        // Kirim per batch supaya tidak kena limit ukuran request kalau upload sangat besar.
+        const BATCH = 500;
+        for (let i = 0; i < newRows.length; i += BATCH) {
+          const chunk = newRows.slice(i, i + BATCH).map(r => ({
+            row_key: keyFn(r),
+            data: r,
+            updated_at: new Date().toISOString()
+          }));
+          const { error } = await sb.from(table).upsert(chunk, { onConflict: 'row_key' });
+          if (error) { setSyncStatus('⚠️ Gagal sync: ' + error.message); return; }
+        }
+        setSyncStatus('✅ Tersinkron ' + new Date().toLocaleTimeString('id-ID'));
+      } catch (err) {
+        setSyncStatus('⚠️ Gagal sync: ' + err.message);
+      }
+    }
+
+    // Tarik SEMUA baris dari tabel cloud (dengan pagination, karena Supabase
+    // membatasi maksimal 1000 baris per request).
+    async function pullAllRowsFromCloud(table) {
+      const PAGE = 1000;
+      let from = 0;
+      let all = [];
+      try {
+        while (true) {
+          const { data, error } = await sb.from(table).select('data').range(from, from + PAGE - 1);
+          if (error) { console.warn('Gagal ambil data cloud (' + table + '):', error.message); break; }
+          if (!data || !data.length) break;
+          all = all.concat(data.map(d => d.data));
+          if (data.length < PAGE) break;
+          from += PAGE;
+        }
+      } catch (err) {
+        console.warn('Gagal ambil data cloud (' + table + '):', err);
+      }
+      return all;
+    }
+
+    async function deleteAllRowsFromCloud(table) {
+      try {
+        setSyncStatus('⏳ Menghapus data di cloud...');
+        const { error } = await sb.from(table).delete().not('row_key', 'is', null);
+        if (error) { setSyncStatus('⚠️ Gagal hapus cloud: ' + error.message); return; }
+        setSyncStatus('✅ Data cloud dihapus ' + new Date().toLocaleTimeString('id-ID'));
+      } catch (err) {
+        setSyncStatus('⚠️ Gagal hapus cloud: ' + err.message);
       }
     }
 
@@ -1250,35 +1319,9 @@
       });
     }
 
-    // ---- Gabungkan (merge) data lokal dengan data cloud terbaru sebelum menimpa ----
-    // Mencegah kasus: device/tab lain sudah upload data baru ke cloud, tapi tab ini
-    // masih pegang data lama -> kalau langsung overwrite, data baru dari device lain hilang.
-    // Solusinya: tarik dulu data cloud paling baru, gabungkan baris yang belum ada
-    // (berdasarkan key unik) ke data lokal, baru simpan hasil gabungan.
-    async function mergeCloudBeforeSave(id, localRows, keyFn) {
-      try {
-        const cloudRows = await pullStateFromCloud(id);
-        if (!cloudRows || !cloudRows.length) return localRows;
-        const seen = new Set(localRows.map(keyFn));
-        const merged = localRows.slice();
-        for (const r of cloudRows) {
-          const k = keyFn(r);
-          if (!seen.has(k)) {
-            merged.push(r);
-            seen.add(k);
-          }
-        }
-        return merged;
-      } catch (err) {
-        console.warn('Gagal merge data cloud (' + id + '):', err);
-        return localRows;
-      }
-    }
+    // ---- Simpan data lokal ke IndexedDB (cache offline) & cloud (per-baris) ----
 
-    async function saveRowsToDB() {
-      const cashKey = r => r.faktur + '|' + r.sheet + '|' + r.section + '|' + r.tagihan;
-      allRows = await mergeCloudBeforeSave('cash_inflow', allRows, cashKey);
-      invalidateFakturIndex();
+    async function saveRowsToDB(newRows) {
       try {
         const db = await openDB();
         await new Promise((resolve, reject) => {
@@ -1290,9 +1333,9 @@
       } catch (err) {
         console.warn('Gagal simpan data ke IndexedDB:', err);
       }
-      pushStateToCloud('cash_inflow', allRows);
-      showSummary();
-      if (typeof doSearch === 'function') doSearch();
+      // Kirim hanya baris baru (bukan seluruh allRows) - jauh lebih ringan & tidak
+      // pernah menimpa data yang diupload device lain, karena tiap baris punya row_key unik.
+      pushNewRowsToCloud(CASH_TABLE, newRows && newRows.length ? newRows : allRows, cashRowKey);
     }
 
     async function loadRowsFromDB() {
@@ -1322,14 +1365,13 @@
       } catch (err) {
         console.warn('Gagal hapus data di IndexedDB:', err);
       }
-      pushStateToCloud('cash_inflow', []);
+      pushStateToCloud('cash_inflow', []); // kompatibilitas blob lama (kosongkan juga)
+      deleteAllRowsFromCloud(CASH_TABLE);
     }
 
     const DB_KEY_SALES = 'salesRows';
 
-    async function saveSalesToDB() {
-      const salesKey = r => r.noFaktur + '|' + r.produk + '|' + r.jumlah + '|' + r.total + '|' + r.sheet;
-      salesRows = await mergeCloudBeforeSave('sales', salesRows, salesKey);
+    async function saveSalesToDB(newRows) {
       try {
         const db = await openDB();
         await new Promise((resolve, reject) => {
@@ -1341,9 +1383,7 @@
       } catch (err) {
         console.warn('Gagal simpan data penjualan ke IndexedDB:', err);
       }
-      pushStateToCloud('sales', salesRows);
-      populateSalesFilters();
-      if (typeof doSalesSearch === 'function') doSalesSearch();
+      pushNewRowsToCloud(SALES_TABLE, newRows && newRows.length ? newRows : salesRows, salesRowKey);
     }
 
     async function loadSalesFromDB() {
@@ -1373,7 +1413,8 @@
       } catch (err) {
         console.warn('Gagal hapus data penjualan di IndexedDB:', err);
       }
-      pushStateToCloud('sales', []);
+      pushStateToCloud('sales', []); // kompatibilitas blob lama (kosongkan juga)
+      deleteAllRowsFromCloud(SALES_TABLE);
     }
 
     const fileInput = document.getElementById('fileInput');
@@ -1558,6 +1599,7 @@
 
       let added = 0;
       const names = [];
+      const newRowsThisUpload = [];
       // PERF: bangun Set kunci duplikat SEKALI di luar loop file, lalu update
       // secara incremental. Sebelumnya Set ini dibangun ulang dari seluruh
       // allRows.map() di setiap iterasi file -> O(jumlah_file * jumlah_baris),
@@ -1577,6 +1619,7 @@
             if (!existing.has(k)) {
               allRows.push(r);
               existing.add(k);
+              newRowsThisUpload.push(r);
               added++;
             }
           }
@@ -1602,7 +1645,7 @@
       }
       showSummary();
       searchBar.classList.add('show');
-      saveRowsToDB();
+      saveRowsToDB(newRowsThisUpload);
       document.getElementById('tabsBar').style.display = 'flex';
     }
 
@@ -1974,6 +2017,7 @@
       salesTableWrap.style.display = 'none';
 
       const names = [];
+      const newSalesThisUpload = [];
       // PERF: sama seperti handleFiles - Set kunci duplikat dibangun sekali
       // di luar loop, bukan dibangun ulang dari salesRows.map() per file.
       const key = r => r.noFaktur + '|' + r.produk + '|' + r.jumlah + '|' + r.total + '|' + r.sheet;
@@ -1991,6 +2035,7 @@
             if (!existing.has(k)) {
               salesRows.push(r);
               existing.add(k);
+              newSalesThisUpload.push(r);
             }
           }
         } catch (err) {
@@ -2013,7 +2058,7 @@
       salesSearchBar.classList.add('show');
       populateSalesFilters();
       doSalesSearch(); // filter ke bulan terbaru
-      saveSalesToDB();
+      saveSalesToDB(newSalesThisUpload);
       document.getElementById('tabsBar').style.display = 'flex';
     }
 
@@ -2886,47 +2931,76 @@
       }
     }
 
-    // ---- Load data: coba dari Supabase (cloud) dulu, fallback ke cache lokal (offline) ----
+    // ---- Load data: coba dari Supabase (cloud, tabel per-baris) dulu, fallback ke cache lokal (offline) ----
     // PENTING: initialLoadPromise WAJIB ditunggu (await) sebelum handleFiles/handleSalesFiles
-    // memproses upload apapun. Tanpa ini, upload yang dilakukan SEBELUM data lama selesai
-    // ditarik dari cloud akan menimpa (overwrite) seluruh data cloud dengan hanya isi file
-    // yang baru diupload -> inilah penyebab data bulan sebelumnya "hilang" saat upload bulan baru.
+    // memproses upload apapun, supaya baris lama sempat termuat dulu sebelum dedup dijalankan.
     let initialLoadDone = false;
     const initialLoadPromise = (async function initFromCloudOrDB() {
       setSyncStatus('⏳ Memuat data...');
       const [cashCloud, salesCloud] = await Promise.all([
-        pullStateFromCloud('cash_inflow'),
-        pullStateFromCloud('sales')
+        pullAllRowsFromCloud(CASH_TABLE),
+        pullAllRowsFromCloud(SALES_TABLE)
       ]);
 
-      if (cashCloud) {
+      if (cashCloud && cashCloud.length) {
         applyCashData(cashCloud);
       } else {
         const saved = await loadRowsFromDB();
         if (saved && saved.length) applyCashData(saved);
       }
 
-      if (salesCloud) {
+      if (salesCloud && salesCloud.length) {
         applySalesData(salesCloud);
       } else {
         const savedSales = await loadSalesFromDB();
         if (savedSales && savedSales.length) applySalesData(savedSales);
       }
 
-      setSyncStatus(cashCloud || salesCloud ? '✅ Data terbaru dari cloud' : '📴 Mode offline (data lokal)');
+      setSyncStatus((cashCloud && cashCloud.length) || (salesCloud && salesCloud.length) ? '✅ Data terbaru dari cloud' : '📴 Mode offline (data lokal)');
 
       // ---- Realtime: auto-update kalau rekan kerja upload/ubah data di device lain ----
+      // Sekarang per-baris: setiap event cuma bawa 1 baris yang berubah (bukan seluruh
+      // dataset), jadi update-nya ditambahkan/diganti langsung ke array lokal - jauh lebih
+      // ringan dibanding dulu (replace total setiap kali ada perubahan sekecil apapun).
       sb.channel('datacenter-sync')
-        .on('postgres_changes', { event: '*', schema: 'public', table: SB_TABLE }, payload => {
-          const row = payload.new;
-          if (!row) return;
-          if (row.id === 'cash_inflow') {
-            applyCashData(row.data || []);
-            setSyncStatus('🔄 Data cash inflow diperbarui oleh rekan kerja · ' + new Date().toLocaleTimeString('id-ID'));
-          } else if (row.id === 'sales') {
-            applySalesData(row.data || []);
-            setSyncStatus('🔄 Data penjualan diperbarui oleh rekan kerja · ' + new Date().toLocaleTimeString('id-ID'));
+        .on('postgres_changes', { event: '*', schema: 'public', table: CASH_TABLE }, payload => {
+          if (payload.eventType === 'DELETE') {
+            // Semua/beberapa baris dihapus (mis. tombol Hapus Data) -> muat ulang penuh biar konsisten.
+            pullAllRowsFromCloud(CASH_TABLE).then(rows => {
+              applyCashData(rows);
+              setSyncStatus('🔄 Data cash inflow diperbarui oleh rekan kerja · ' + new Date().toLocaleTimeString('id-ID'));
+            });
+            return;
           }
+          const row = payload.new && payload.new.data;
+          if (!row) return;
+          const k = cashRowKey(row);
+          const idx = allRows.findIndex(r => cashRowKey(r) === k);
+          if (idx >= 0) allRows[idx] = row; else allRows.push(row);
+          invalidateFakturIndex();
+          if (emptyState.style.display !== 'none') applyCashData(allRows); // baris pertama yang masuk
+          showSummary();
+          if (typeof doSearch === 'function') doSearch();
+          setSyncStatus('🔄 Data cash inflow diperbarui oleh rekan kerja · ' + new Date().toLocaleTimeString('id-ID'));
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: SALES_TABLE }, payload => {
+          if (payload.eventType === 'DELETE') {
+            pullAllRowsFromCloud(SALES_TABLE).then(rows => {
+              applySalesData(rows);
+              setSyncStatus('🔄 Data penjualan diperbarui oleh rekan kerja · ' + new Date().toLocaleTimeString('id-ID'));
+            });
+            return;
+          }
+          const row = payload.new && payload.new.data;
+          if (!row) return;
+          if (!row.month) row.month = detectMonth(row.sheet, row.tanggal) || 'Lainnya';
+          const k = salesRowKey(row);
+          const idx = salesRows.findIndex(r => salesRowKey(r) === k);
+          if (idx >= 0) salesRows[idx] = row; else salesRows.push(row);
+          if (salesEmptyState.style.display !== 'none') applySalesData(salesRows); // baris pertama yang masuk
+          populateSalesFilters();
+          if (typeof doSalesSearch === 'function') doSalesSearch();
+          setSyncStatus('🔄 Data penjualan diperbarui oleh rekan kerja · ' + new Date().toLocaleTimeString('id-ID'));
         })
         .subscribe();
 
