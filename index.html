@@ -1250,7 +1250,35 @@
       });
     }
 
+    // ---- Gabungkan (merge) data lokal dengan data cloud terbaru sebelum menimpa ----
+    // Mencegah kasus: device/tab lain sudah upload data baru ke cloud, tapi tab ini
+    // masih pegang data lama -> kalau langsung overwrite, data baru dari device lain hilang.
+    // Solusinya: tarik dulu data cloud paling baru, gabungkan baris yang belum ada
+    // (berdasarkan key unik) ke data lokal, baru simpan hasil gabungan.
+    async function mergeCloudBeforeSave(id, localRows, keyFn) {
+      try {
+        const cloudRows = await pullStateFromCloud(id);
+        if (!cloudRows || !cloudRows.length) return localRows;
+        const seen = new Set(localRows.map(keyFn));
+        const merged = localRows.slice();
+        for (const r of cloudRows) {
+          const k = keyFn(r);
+          if (!seen.has(k)) {
+            merged.push(r);
+            seen.add(k);
+          }
+        }
+        return merged;
+      } catch (err) {
+        console.warn('Gagal merge data cloud (' + id + '):', err);
+        return localRows;
+      }
+    }
+
     async function saveRowsToDB() {
+      const cashKey = r => r.faktur + '|' + r.sheet + '|' + r.section + '|' + r.tagihan;
+      allRows = await mergeCloudBeforeSave('cash_inflow', allRows, cashKey);
+      invalidateFakturIndex();
       try {
         const db = await openDB();
         await new Promise((resolve, reject) => {
@@ -1263,6 +1291,8 @@
         console.warn('Gagal simpan data ke IndexedDB:', err);
       }
       pushStateToCloud('cash_inflow', allRows);
+      showSummary();
+      if (typeof doSearch === 'function') doSearch();
     }
 
     async function loadRowsFromDB() {
@@ -1298,6 +1328,8 @@
     const DB_KEY_SALES = 'salesRows';
 
     async function saveSalesToDB() {
+      const salesKey = r => r.noFaktur + '|' + r.produk + '|' + r.jumlah + '|' + r.total + '|' + r.sheet;
+      salesRows = await mergeCloudBeforeSave('sales', salesRows, salesKey);
       try {
         const db = await openDB();
         await new Promise((resolve, reject) => {
@@ -1310,6 +1342,8 @@
         console.warn('Gagal simpan data penjualan ke IndexedDB:', err);
       }
       pushStateToCloud('sales', salesRows);
+      populateSalesFilters();
+      if (typeof doSalesSearch === 'function') doSalesSearch();
     }
 
     async function loadSalesFromDB() {
@@ -1487,6 +1521,7 @@
     document.getElementById('filterStatus').addEventListener('change', doSearch);
 
     function clearData() {
+      if (!confirm('Yakin mau HAPUS SEMUA data Cash Inflow?\n\nIni akan menghapus data untuk SEMUA orang yang pakai aplikasi ini (tersinkron ke cloud) dan TIDAK BISA dibatalkan.\n\nKalau tidak yakin, tekan Cancel.')) return;
       allRows = [];
       invalidateFakturIndex();
       clearRowsInDB();
@@ -2537,6 +2572,7 @@
     }
 
     function clearSalesData() {
+      if (!confirm('Yakin mau HAPUS SEMUA data Penjualan?\n\nIni akan menghapus data untuk SEMUA orang yang pakai aplikasi ini (tersinkron ke cloud) dan TIDAK BISA dibatalkan.\n\nKalau tidak yakin, tekan Cancel.')) return;
       salesRows = [];
       lastSalesFiltered = [];
       lastProfitProdukRows = [];
